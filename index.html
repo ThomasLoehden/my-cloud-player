@@ -346,8 +346,13 @@
                     handleLoginSuccess(savedState); // Pass pre-fetched state
                 }
 
-                // Initialize GSI Token Client
-                initializeGsiClient();
+                // Only initialize Google Sign-In if we are online.
+                if (!isOffline) {
+                    initializeGsiClient();
+                } else if (!savedToken) {
+                    // If offline AND not logged in, there's nothing to do.
+                    welcomeMessage.innerHTML = '<p class="text-gray-500 dark:text-gray-400">You are offline. Connect to the internet to sign in.</p>';
+                }
 
             } catch (error) {
                 console.error("Failed to initialize the app:", error);
@@ -555,7 +560,12 @@
         /* --- Logic --- */
         async function handleLoginSuccess(initialState = null) {
             updateUI(true);
-            await fetchUserProfile();
+            if (!isOffline) {
+                await fetchUserProfile();
+            } else {
+                const savedUserName = await idbGet('userName');
+                if (savedUserName) userNameSpan.textContent = savedUserName;
+            }
             
             // Check for folderId in URL
             const urlParams = new URLSearchParams(window.location.search);
@@ -609,6 +619,7 @@
                 const data = await response.json();
                 if (data.name) {
                     userNameSpan.textContent = data.name;
+                    await idbSet('userName', data.name);
                 }
             } catch (error) {
                 console.error('Profile fetch error:', error);
