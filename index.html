@@ -9,7 +9,8 @@
     <meta name="mobile-web-app-capable" content="yes">
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
     <meta name="apple-mobile-web-app-title" content="CloudAudio">
-    <link rel="icon" href="data:,">
+    <link rel="icon" type="image/png" href="assets/icon-192.png">
+    <link rel="apple-touch-icon" href="assets/icon-192.png">
     <link rel="manifest" href="manifest.json">
     <meta name="theme-color" content="#059669">
 
@@ -264,6 +265,15 @@
             const savedToken = localStorage.getItem('google_access_token');
             if (savedToken) {
                 accessToken = savedToken;
+                // Send token to Service Worker on initial load
+                if (navigator.serviceWorker.controller) {
+                    navigator.serviceWorker.controller.postMessage({ type: 'SET_TOKEN', token: accessToken });
+                } else {
+                    // If SW is not active yet, wait for it.
+                    navigator.serviceWorker.ready.then(registration => {
+                        registration.active.postMessage({ type: 'SET_TOKEN', token: accessToken });
+                    });
+                }
                 handleLoginSuccess();
             }
 
@@ -275,6 +285,8 @@
                     if (tokenResponse && tokenResponse.access_token) {
                         accessToken = tokenResponse.access_token;
                         localStorage.setItem('google_access_token', accessToken);
+                        // Send token to SW on new login
+                        navigator.serviceWorker.controller.postMessage({ type: 'SET_TOKEN', token: accessToken });
                         handleLoginSuccess();
                     }
                 },
@@ -771,44 +783,52 @@
 
         /* --- Audio Engine --- */
         async function playTrack(index, autoPlay = true, startAt = 0) {
-            if (index < 0 || index >= activePlaylist.length) return;
-
-            currentTrackIndex = index;
-            const track = activePlaylist[index];
-            
-            // Reset Audio State immediately to stop previous track
-            audio.pause();
-            audio.src = '';
-            const loadingIcon = '<span class="animate-spin inline-block">↻</span>';
-            miniPlayBtn.innerHTML = loadingIcon;
-            fullPlayBtn.innerHTML = loadingIcon;
-
-            // Cleanup previous object URL
-            if (currentObjectUrl) {
-                URL.revokeObjectURL(currentObjectUrl);
-                currentObjectUrl = null;
-            }
-
             try {
-                const mediaUrl = `https://www.googleapis.com/drive/v3/files/${track.id}?alt=media`;
-                const audioCache = await caches.open(AUDIO_CACHE_NAME);
-                let response = await audioCache.match(mediaUrl);
-                let source = 'CACHE';
+                if (index < 0 || index >= activePlaylist.length) return;
 
-                if (!response) {
-                    source = 'NETWORK';
-                    console.log(`Playing ${track.name} from NETWORK`);
-                    response = await fetch(mediaUrl, {
-                        headers: { 'Authorization': `Bearer ${accessToken}` }
-                    });
-                    if (!response.ok) throw new Error('Playback fetch failed');
-                } else {
-                    console.log(`Playing ${track.name} from CACHE`);
+                currentTrackIndex = index;
+                const track = activePlaylist[index];
+                
+                // Reset Audio State immediately to stop previous track
+                audio.pause();
+                audio.src = '';
+                const loadingIcon = '<span class="animate-spin inline-block">↻</span>';
+                miniPlayBtn.innerHTML = loadingIcon;
+                fullPlayBtn.innerHTML = loadingIcon;
+
+                // Cleanup previous object URL
+                if (currentObjectUrl) {
+                    URL.revokeObjectURL(currentObjectUrl);
+                    currentObjectUrl = null;
                 }
 
-                const blob = await response.blob();
-                currentObjectUrl = URL.createObjectURL(blob);
-                
+                const mediaUrl = `https://www.googleapis.com/drive/v3/files/${track.id}?alt=media`;
+                const audioCache = await caches.open(AUDIO_CACHE_NAME);
+                const cachedResponse = await audioCache.match(mediaUrl);
+
+                if (cachedResponse) {
+                    // --- PATH 1: PLAY FROM CACHE ---
+                    console.log(`Playing ${track.name} from CACHE`);
+                    const blob = await cachedResponse.blob();
+                    currentObjectUrl = URL.createObjectURL(blob);
+                    audio.src = currentObjectUrl;
+                } else {
+                    // --- PATH 2: STREAM FROM NETWORK ---
+                    if (isOffline) {
+                        console.error("Cannot play track: Offline and not in cache.");
+                        miniPlayBtn.innerHTML = '⚠️';
+                        fullPlayBtn.innerHTML = '⚠️';
+                        return;
+                    }
+                    console.log(`Playing ${track.name} from NETWORK (streaming)`);
+                    // **Crucial Fix**: Ensure the SW has the token right before we ask it to stream.
+                    if (navigator.serviceWorker.controller) {
+                        navigator.serviceWorker.controller.postMessage({ type: 'SET_TOKEN', token: accessToken });
+                    }
+                    // Let the service worker handle the authenticated fetch for streaming
+                    audio.src = mediaUrl;
+                }
+
                 // Resume Logic: Attach listener before setting src
                 if (startAt > 0) {
                     audio.addEventListener('loadedmetadata', () => {
@@ -818,21 +838,25 @@
                     }, { once: true });
                 }
 
-                audio.src = currentObjectUrl;
                 audio.title = track.name; // Store title on audio object for reference
                 
                 if (autoPlay) {
-                    audio.play().catch(e => console.error("Playback failed", e));
-                    updatePlayBtn(true);
+                    const playPromise = audio.play();
+                    if (playPromise !== undefined) {
+                        playPromise.then(() => updatePlayBtn(true))
+                                 .catch(error => {
+                                     console.error("Auto-play was prevented:", error);
+                                     updatePlayBtn(false); // Show play button if autoplay is blocked
+                                 });
+                    }
                 } else {
                     updatePlayBtn(false);
                 }
 
-                // Update UI Text
+                // Update UI Text and Media Session
                 miniTitle.textContent = track.name;
                 fullTitle.textContent = track.name;
                 playerUi.classList.remove('hidden');
-
                 // Setup Media Session
                 if ('mediaSession' in navigator) {
                     navigator.mediaSession.metadata = new MediaMetadata({
@@ -846,12 +870,10 @@
                     navigator.mediaSession.setActionHandler('previoustrack', playPrevious);
                     navigator.mediaSession.setActionHandler('nexttrack', playNext);
                 }
-
-                saveState();
             } catch (error) {
                 console.error('Error playing track:', error);
-                miniPlayBtn.textContent = '⚠️';
-                fullPlayBtn.textContent = '⚠️';
+                miniPlayBtn.innerHTML = '⚠️';
+                fullPlayBtn.innerHTML = '⚠️';
             }
         }
 
