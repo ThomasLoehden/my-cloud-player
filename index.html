@@ -89,10 +89,16 @@
         
         <!-- Folder Input Form (Hidden by default) -->
         <div id="folder-input-container" class="hidden flex flex-col items-center justify-center space-y-4 mt-10">
-            <p class="text-gray-600 dark:text-gray-300">Enter a Google Drive Folder ID to start:</p>
+            <p class="text-gray-600 dark:text-gray-300">Select a folder or add a new one:</p>
             <div class="flex w-full max-w-xs space-x-2">
-                <input type="text" id="folder-id-input" placeholder="Folder ID" class="flex-1 rounded-md border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-brand">
+                <select id="folder-select" class="flex-1 rounded-md border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-brand">
+                    <!-- Options will be populated by JS -->
+                </select>
                 <button id="load-folder-btn" class="bg-brand text-white px-4 py-2 rounded-md text-sm font-medium hover:bg-blue-600">Load</button>
+            </div>
+            <div id="new-folder-input-group" class="hidden w-full max-w-xs pt-2 space-y-2">
+                <input type="text" id="new-folder-name-input" placeholder="Folder Name (e.g., 'My Podcasts')" class="w-full rounded-md border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-brand">
+                <input type="text" id="folder-id-input" placeholder="Google Drive Folder ID" class="w-full rounded-md border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-brand">
             </div>
             <p class="text-xs text-gray-400">Or use a shared link with ?folderId=...</p>
         </div>
@@ -131,6 +137,9 @@
         <div id="full-player" class="hidden flex-col justify-center h-screen w-full bg-white dark:bg-gray-800 absolute top-0 left-0 p-6 pb-32 overflow-y-auto z-60">
             <button id="player-collapse-btn" class="absolute top-6 right-6 text-gray-500 p-4 z-50 hover:text-gray-700 transition-colors">
                 <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" class="w-8 h-8"><path stroke-linecap="round" stroke-linejoin="round" d="M19.5 8.25l-7.5 7.5-7.5-7.5" /></svg>
+            </button>
+            <button id="player-close-btn" class="absolute top-6 left-6 text-gray-500 p-4 z-50 hover:text-red-500 transition-colors">
+                <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" class="w-8 h-8"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12" /></svg>
             </button>
             
             <div class="w-64 h-64 bg-gray-100 dark:bg-gray-700 rounded-2xl mx-auto mb-8 flex items-center justify-center text-8xl shadow-inner text-gray-300">
@@ -201,6 +210,61 @@
         let isPlayerExpanded = false;
         let currentObjectUrl = null;
 
+        /* --- IndexedDB --- */
+        const DB_NAME = 'CloudAudioDB';
+        const STORE_NAME = 'KeyValueStore';
+        let db;
+
+        function initDB() {
+            return new Promise((resolve, reject) => {
+                const request = indexedDB.open(DB_NAME, 1);
+                request.onerror = (event) => reject("IndexedDB error: " + request.error);
+                request.onsuccess = (event) => {
+                    db = event.target.result;
+                    resolve(db);
+                };
+                request.onupgradeneeded = (event) => {
+                    const db = event.target.result;
+                    if (!db.objectStoreNames.contains(STORE_NAME)) {
+                        db.createObjectStore(STORE_NAME, { keyPath: 'key' });
+                    }
+                };
+            });
+        }
+
+        function idbGet(key) {
+            return new Promise((resolve, reject) => {
+                if (!db) return reject("DB not initialized");
+                const transaction = db.transaction([STORE_NAME], 'readonly');
+                const store = transaction.objectStore(STORE_NAME);
+                const request = store.get(key);
+                request.onsuccess = () => resolve(request.result ? request.result.value : undefined);
+                request.onerror = () => reject("Error getting data: " + request.error);
+            });
+        }
+
+        function idbSet(key, value) {
+            return new Promise((resolve, reject) => {
+                if (!db) return reject("DB not initialized");
+                const transaction = db.transaction([STORE_NAME], 'readwrite');
+                const store = transaction.objectStore(STORE_NAME);
+                const request = store.put({ key, value });
+                request.onsuccess = () => resolve();
+                request.onerror = () => reject("Error setting data: " + request.error);
+            });
+        }
+
+        function idbClear() {
+            return new Promise((resolve, reject) => {
+                if (!db) return reject("DB not initialized");
+                const transaction = db.transaction([STORE_NAME], 'readwrite');
+                const store = transaction.objectStore(STORE_NAME);
+                const request = store.clear();
+                request.onsuccess = () => resolve();
+                request.onerror = () => reject("Error clearing data: " + request.error);
+            });
+        }
+
         /* --- DOM Elements --- */
         const loginBtn = document.getElementById('login-btn');
         const signoutBtn = document.getElementById('signout-btn');
@@ -225,80 +289,94 @@
         const loopBtn = document.getElementById('loop-btn');
         const expandBtn = document.getElementById('player-expand-btn');
         const collapseBtn = document.getElementById('player-collapse-btn');
+        const closeBtn = document.getElementById('player-close-btn');
         const seekSlider = document.getElementById('seek-slider');
         const currentTimeSpan = document.getElementById('current-time');
         const durationSpan = document.getElementById('duration');
         const miniProgressBar = document.getElementById('mini-progress-bar');
 
         /* --- Initialization --- */
-        window.onload = function() {
-            // Load the cached library map on startup
-            const savedLibrary = localStorage.getItem('cloudAudio_libraryMap');
-            if (savedLibrary) {
-                try {
-                    libraryMap = JSON.parse(savedLibrary);
-                } catch (e) {
-                    console.error("Could not parse library map from localStorage", e);
-                    libraryMap = {};
+        window.onload = async function() {
+            try {
+                await initDB();
+                
+                // Load saved folders and populate dropdown
+                let savedFolders = await idbGet('savedFolders') || [];
+                if (savedFolders.length === 0) {
+                    // Add the default one if it's the first time
+                    savedFolders.push({ id: '1WKVD6rASDFKlVPFnMZiipo7aFh_nzBZV', name: 'Thomas Drive' });
+                    await idbSet('savedFolders', savedFolders);
                 }
-            }
+                populateFolderSelect(savedFolders);
+                
+                // Load all state from IDB concurrently
+                const [savedLibrary, savedCacheIds, savedShuffle, savedLoop, savedState] = await Promise.all([
+                    idbGet('libraryMap'),
+                    idbGet('cachedFileIds'),
+                    idbGet('shuffleMode'),
+                    idbGet('loopMode'),
+                    idbGet('cloudAudio_state') // Pre-fetch state
+                ]);
 
-            // Load the set of cached file IDs
-            const savedCacheIds = localStorage.getItem('cloudAudio_cachedIds');
-            if (savedCacheIds) {
-                try {
-                    cachedFileIds = new Set(JSON.parse(savedCacheIds));
-                } catch (e) { console.error("Could not parse cached IDs", e); }
-            }
+                if (savedLibrary) libraryMap = savedLibrary;
+                if (savedCacheIds) cachedFileIds = new Set(savedCacheIds);
+                shuffleMode = savedShuffle === true;
+                loopMode = savedLoop || 'none';
+                
+                updateShuffleButton();
+                updateLoopButton();
 
-            // Load player settings
-            shuffleMode = localStorage.getItem('cloudAudio_shuffle') === 'true';
-            loopMode = localStorage.getItem('cloudAudio_loop') || 'none';
-            updateShuffleButton();
-            updateLoopButton();
-
-            if (isOffline) {
-                offlineIndicator.classList.remove('hidden');
-            }
-
-            // Check for saved token in sessionStorage
-            const savedToken = localStorage.getItem('google_access_token');
-            if (savedToken) {
-                accessToken = savedToken;
-                // Send token to Service Worker on initial load
-                if (navigator.serviceWorker.controller) {
-                    navigator.serviceWorker.controller.postMessage({ type: 'SET_TOKEN', token: accessToken });
-                } else {
-                    // If SW is not active yet, wait for it.
-                    navigator.serviceWorker.ready.then(registration => {
-                        registration.active.postMessage({ type: 'SET_TOKEN', token: accessToken });
-                    });
+                if (isOffline) {
+                    offlineIndicator.classList.remove('hidden');
                 }
-                handleLoginSuccess();
-            }
 
-            // Initialize GSI Token Client (OAuth 2.0 Implicit Flow)
-            tokenClient = google.accounts.oauth2.initTokenClient({
-                client_id: CLIENT_ID,
-                scope: SCOPES,
-                callback: (tokenResponse) => {
+                // Check for saved token in localStorage (tokens are simple and can stay here)
+                const savedToken = localStorage.getItem('google_access_token');
+                if (savedToken) {
+                    accessToken = savedToken;
+                    // Send token to Service Worker on initial load
+                    if (navigator.serviceWorker.controller) {
+                        navigator.serviceWorker.controller.postMessage({ type: 'SET_TOKEN', token: accessToken });
+                    } else {
+                        // If SW is not active yet, wait for it.
+                        navigator.serviceWorker.ready.then(registration => {
+                            registration.active.postMessage({ type: 'SET_TOKEN', token: accessToken });
+                        });
+                    }
+                    handleLoginSuccess(savedState); // Pass pre-fetched state
+                }
+
+                // Initialize GSI Token Client
+                initializeGsiClient();
+
+            } catch (error) {
+                console.error("Failed to initialize the app:", error);
+                document.body.innerHTML = '<div class="text-center p-8 text-red-500">A critical error occurred. Could not initialize the database. Please try clearing site data and reloading.</div>';
+            }
+        };
+
+        function initializeGsiClient() {
+             tokenClient = google.accounts.oauth2.initTokenClient({
+                 client_id: CLIENT_ID,
+                 scope: SCOPES,
+                 callback: (tokenResponse) => {
                     if (tokenResponse && tokenResponse.access_token) {
                         accessToken = tokenResponse.access_token;
                         localStorage.setItem('google_access_token', accessToken);
                         // Send token to SW on new login
                         navigator.serviceWorker.controller.postMessage({ type: 'SET_TOKEN', token: accessToken });
-                        handleLoginSuccess();
+                        handleLoginSuccess(); // On new login, don't pass state
                     }
-                },
-            });
-        };
+                 },
+             });
+        }
 
         /* --- Event Listeners --- */
         loginBtn.addEventListener('click', () => {
             tokenClient.requestAccessToken();
         });
 
-        signoutBtn.addEventListener('click', () => {
+        signoutBtn.addEventListener('click', async () => {
             const token = accessToken;
             // 1. Revoke the token on Google's side to invalidate the session.
             if (token) {
@@ -307,17 +385,47 @@
             // 2. Clear all application state from storage. This is crucial.
             accessToken = null;
             localStorage.removeItem('google_access_token');
-            localStorage.removeItem('cloudAudio_state');
-            localStorage.removeItem('cloudAudio_libraryMap');
+            await idbClear();
 
             // 3. Reload the page. This forces a complete reset of the Google Sign-In
             // library and ensures the login button will work reliably.
             window.location.reload();
         });
 
-        document.getElementById('load-folder-btn').addEventListener('click', () => {
-            const inputId = document.getElementById('folder-id-input').value.trim();
-            if (inputId) fetchFolderContent(inputId);
+        document.getElementById('folder-select').addEventListener('change', (e) => {
+            const newFolderGroup = document.getElementById('new-folder-input-group');
+            if (e.target.value === 'add_new') {
+                newFolderGroup.classList.remove('hidden');
+            } else {
+                newFolderGroup.classList.add('hidden');
+            }
+        });
+
+        document.getElementById('load-folder-btn').addEventListener('click', async () => {
+            const select = document.getElementById('folder-select');
+            const idInput = document.getElementById('folder-id-input');
+            const nameInput = document.getElementById('new-folder-name-input');
+            let folderId = select.value;
+
+            if (folderId === 'add_new') {
+                folderId = idInput.value.trim();
+                if (folderId) {
+                    // Save the new folder for next time
+                    let savedFolders = await idbGet('savedFolders') || [];
+                    if (!savedFolders.some(f => f.id === folderId)) {
+                        let folderName = nameInput.value.trim();
+                        if (!folderName) {
+                            folderName = `Folder ${savedFolders.length + 1}`;
+                        }
+                        savedFolders.push({ id: folderId, name: folderName });
+                        await idbSet('savedFolders', savedFolders);
+                        populateFolderSelect(savedFolders); // Refresh dropdown
+                    }
+                    fetchFolderContent(folderId);
+                }
+            } else if (folderId) {
+                fetchFolderContent(folderId);
+            }
         });
 
         // Player Controls
@@ -330,6 +438,7 @@
         
         expandBtn.addEventListener('click', () => togglePlayerMode(true));
         collapseBtn.addEventListener('click', () => togglePlayerMode(false));
+        closeBtn.addEventListener('click', closePlayer);
         miniPlayer.addEventListener('click', (e) => {
             if (e.target !== miniPlayBtn && e.target !== expandBtn) togglePlayerMode(true);
         });
@@ -375,7 +484,7 @@
                 cachedFileIds.add(trackId);
                 downloadingFileIds.delete(trackId); // Remove from in-progress set
 
-                localStorage.setItem('cloudAudio_cachedIds', JSON.stringify(Array.from(cachedFileIds)));
+                idbSet('cachedFileIds', Array.from(cachedFileIds));
                 
                 // Re-render the library to update the UI for the downloaded track
                 if (currentFolderId && libraryMap[currentFolderId]) {
@@ -387,7 +496,7 @@
                 cachedFileIds.delete(trackId);
                 downloadingFileIds.delete(trackId); // Also clear from downloading just in case
 
-                localStorage.setItem('cloudAudio_cachedIds', JSON.stringify(Array.from(cachedFileIds)));
+                idbSet('cachedFileIds', Array.from(cachedFileIds));
 
                 // Re-render to update UI
                 if (currentFolderId && libraryMap[currentFolderId]) {
@@ -403,20 +512,62 @@
             updateUI(false);
         }
 
+        function closePlayer() {
+            audio.pause();
+            audio.src = '';
+            if (currentObjectUrl) {
+                URL.revokeObjectURL(currentObjectUrl);
+                currentObjectUrl = null;
+            }
+            playerUi.classList.add('hidden');
+            currentTrackIndex = -1;
+            if (isPlayerExpanded) {
+                togglePlayerMode(false); // Ensure it's collapsed for next time
+            }
+            // Reset progress UI
+            miniProgressBar.style.width = '0%';
+            seekSlider.value = 0;
+            currentTimeSpan.textContent = '0:00';
+        }
+
+        function populateFolderSelect(folders) {
+            const folderSelect = document.getElementById('folder-select');
+            folderSelect.innerHTML = ''; // Clear existing options
+            
+            const defaultOption = document.createElement('option');
+            defaultOption.value = "";
+            defaultOption.textContent = "-- Select Folder --";
+            folderSelect.appendChild(defaultOption);
+
+            folders.forEach(folder => {
+                const option = document.createElement('option');
+                option.value = folder.id;
+                option.textContent = folder.name;
+                folderSelect.appendChild(option);
+            });
+
+            const addNewOption = document.createElement('option');
+            addNewOption.value = "add_new";
+            addNewOption.textContent = "Add new folder...";
+            folderSelect.appendChild(addNewOption);
+        }
+
         /* --- Logic --- */
-        function handleLoginSuccess() {
+        async function handleLoginSuccess(initialState = null) {
             updateUI(true);
-            fetchUserProfile();
+            await fetchUserProfile();
             
             // Check for folderId in URL
             const urlParams = new URLSearchParams(window.location.search);
             const paramFolderId = urlParams.get('folderId');
             
             if (paramFolderId) {
-                fetchFolderContent(paramFolderId).then(restoreState);
+                await fetchFolderContent(paramFolderId);
             } else {
-                // Check localStorage for resume
-                if (!restoreState()) {
+                // Check IDB for resume
+                const restored = await restoreState(initialState);
+                if (!restored) {
+                    // If nothing was restored, show the folder selection UI
                     welcomeMessage.classList.add('hidden');
                     folderInputContainer.classList.remove('hidden');
                 }
@@ -506,7 +657,7 @@
 
                     // Update master map and save to localStorage
                     libraryMap[folderId] = items;
-                    localStorage.setItem('cloudAudio_libraryMap', JSON.stringify(libraryMap));
+                    await idbSet('libraryMap', libraryMap);
 
                     // Re-render only if we are still viewing the same folder
                     if (currentFolderId === folderId) {
@@ -743,7 +894,7 @@
 
         function toggleShuffle() {
             shuffleMode = !shuffleMode;
-            localStorage.setItem('cloudAudio_shuffle', shuffleMode);
+            idbSet('shuffleMode', shuffleMode);
             updateShuffleButton();
             
             const currentTrack = currentTrackIndex !== -1 ? activePlaylist[currentTrackIndex] : null;
@@ -758,7 +909,7 @@
             if (loopMode === 'none') loopMode = 'folder';
             else if (loopMode === 'folder') loopMode = 'single';
             else loopMode = 'none';
-            localStorage.setItem('cloudAudio_loop', loopMode);
+            idbSet('loopMode', loopMode);
             updateLoopButton();
         }
 
@@ -789,9 +940,17 @@
                 currentTrackIndex = index;
                 const track = activePlaylist[index];
                 
-                // Reset Audio State immediately to stop previous track
+                // Reset Audio State immediately and robustly
                 audio.pause();
                 audio.src = '';
+                audio.load(); // Force the element to reset and abandon the previous source.
+
+                // Reset UI immediately to prevent "stuck" timestamps
+                miniProgressBar.style.width = '0%';
+                seekSlider.value = 0;
+                currentTimeSpan.textContent = '0:00';
+                durationSpan.textContent = '0:00';
+
                 const loadingIcon = '<span class="animate-spin inline-block">↻</span>';
                 miniPlayBtn.innerHTML = loadingIcon;
                 fullPlayBtn.innerHTML = loadingIcon;
@@ -982,30 +1141,28 @@
                 timestamp: Date.now(),
                 folderStack: folderStack
             };
-            localStorage.setItem('cloudAudio_state', JSON.stringify(state));
+            idbSet('cloudAudio_state', state);
         }
 
-        function restoreState() {
-            const saved = localStorage.getItem('cloudAudio_state');
+        async function restoreState(saved = null) {
+            // If state wasn't pre-fetched, get it now.
+            if (saved === null) {
+                saved = await idbGet('cloudAudio_state');
+            }
             if (!saved) return false;
 
-            const state = JSON.parse(saved);
-            
+            const state = saved;
             if (state.folderStack && Array.isArray(state.folderStack)) {
                 folderStack = state.folderStack;
             }
 
-
-            // If we are not already in the folder, load it
-            if (state.folderId && state.folderId !== currentFolderId) {
-                fetchFolderContent(state.folderId).then(() => {
-                    // After folder loads, find file in the active playlist
-                    const index = activePlaylist.findIndex(item => item.id === state.fileId);
-                    if (index !== -1) {
-                        const resumeTime = state.currentTime || 0;
-                        playTrack(index, false, resumeTime); // Load but don't auto-play
-                    }
-                });
+            // If we have a folderId to restore
+            if (state.folderId) {
+                await fetchFolderContent(state.folderId);
+                const index = activePlaylist.findIndex(item => item.id === state.fileId);
+                if (index !== -1) {
+                    playTrack(index, false, state.currentTime || 0);
+                }
                 return true;
             }
             return false;
