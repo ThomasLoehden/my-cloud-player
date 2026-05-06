@@ -3,8 +3,13 @@ const AUDIO_CACHE_NAME = 'cloudaudio-audio-v3';
 const urlsToCache = [
   '/',
   '/index.html',
-  '/manifest.json'
+  '/manifest.json',
+  'assets/icon-192.png',
+  'assets/icon-512.png'
 ];
+
+// This will be set by the main application to enable streaming
+let swAccessToken = null;
 
 // Install event: cache the app shell
 self.addEventListener('install', event => {
@@ -20,6 +25,9 @@ self.addEventListener('install', event => {
 
 // Listen for messages from the main app (e.g., to download a track)
 self.addEventListener('message', event => {
+  if (event.data.type === 'SET_TOKEN') {
+    swAccessToken = event.data.token;
+  }
   if (event.data.type === 'DOWNLOAD_TRACK') {
     const { track, token } = event.data;
     if (!track || !token) return;
@@ -144,18 +152,44 @@ self.addEventListener('activate', event => {
 self.addEventListener('fetch', event => {
   const requestUrl = new URL(event.request.url);
 
-  // Ignore Google API and GSI calls.
-  if (requestUrl.hostname === 'www.googleapis.com' || requestUrl.hostname === 'accounts.google.com') {
+  // Special handling for Google Drive media requests for streaming
+  if (requestUrl.hostname === 'www.googleapis.com' && requestUrl.pathname.includes('/drive/v3/files/')) {
+    event.respondWith((async () => {
+      // For media, always try cache first. This serves fully downloaded files.
+      const audioCache = await caches.open(AUDIO_CACHE_NAME);
+      const cachedResponse = await audioCache.match(event.request.url);
+      if (cachedResponse) {
+        console.log('SW: Serving audio from cache.');
+        return cachedResponse;
+      }
+
+      // If not in cache, go to network for streaming. This requires an auth token.
+      if (!swAccessToken) {
+        console.error('SW: No access token available for streaming request.');
+        return new Response('Service Worker has no auth token.', { status: 401, statusText: 'Unauthorized' });
+      }
+
+      // Create new headers, copying range header from original request for streaming
+      const newHeaders = new Headers();
+      newHeaders.append('Authorization', `Bearer ${swAccessToken}`);
+      if (event.request.headers.has('range')) {
+        newHeaders.append('Range', event.request.headers.get('range'));
+      }
+
+      return fetch(event.request.url, { headers: newHeaders });
+    })());
+    return; // End here for this specific request type
+  }
+
+  // Ignore Google account calls.
+  if (requestUrl.hostname === 'accounts.google.com') {
     return;
   }
 
   // For navigation requests (the HTML page), use a Network First strategy.
   if (event.request.mode === 'navigate') {
     event.respondWith(
-      fetch(event.request).catch(() => {
-        // If the network fails, serve from the cache.
-        return caches.match('/');
-      })
+      fetch(event.request).catch(() => caches.match('/'))
     );
     return;
   }
